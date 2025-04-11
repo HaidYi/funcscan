@@ -25,6 +25,7 @@ include { AMP                       } from '../subworkflows/local/amp'
 include { ARG                       } from '../subworkflows/local/arg'
 include { BGC                       } from '../subworkflows/local/bgc'
 include { TAXA_CLASS                } from '../subworkflows/local/taxa_class'
+include { RENAME_INPUTS             } from '../modules/local/rename_inputs'
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -93,16 +94,39 @@ workflow FUNCSCAN {
 
             [meta, fasta, faa, gbk]
         }
-        .branch { meta, fasta, faa, gbk ->
-            preannotated: gbk != []
-            fastas: true
-        }
+
+        // After creating ch_intermediate_input from mix().groupTuple().map()
+        ch_renamed = ch_intermediate_input
+            .map { meta, fasta, faa, gbk -> tuple(meta, file(fasta), faa ? file(faa) : null, gbk ? file(gbk) : null) }
+            | RENAME_INPUTS
+
+        // Get fasta output (always present)
+        ch_fasta = ch_renamed.fasta_renamed
+
+        // Handle optional channels
+        ch_faa   = ch_renamed.faa_renamed.ifEmpty([])
+        ch_gbk   = ch_renamed.gbk_renamed.ifEmpty([])
+
+        // Merge by meta/sample
+        ch_intermediate_input_renamed = ch_fasta
+            .combine(ch_faa)
+            .combine(ch_gbk)
+            .map { meta_faa, gbk ->
+                def (meta, fasta, faa) = meta_faa
+                [meta, fasta, faa, gbk[1]]
+            }.dump()
+
+        ch_intermediate_input_renamed
+            .branch { meta, fasta, faa, gbk ->
+                preannotated: gbk != []
+                fastas: true
+            }
 
     // Duplicate and filter the duplicated file for long contigs only for BGC
     // This is to speed up BGC run and prevent 'no hits found'  fails
     if (params.run_bgc_screening) {
-        SEQKIT_SEQ_LENGTH(ch_intermediate_input.fastas.map { meta, fasta, faa, gbk -> [meta, fasta] })
-        ch_input_for_annotation = ch_intermediate_input.fastas
+        SEQKIT_SEQ_LENGTH(ch_intermediate_input_renamed.fastas.map { meta, fasta, faa, gbk -> [meta, fasta] })
+        ch_input_for_annotation = ch_intermediate_input_renamed.fastas
             .map { meta, fasta, protein, gbk -> [meta, fasta] }
             .mix(SEQKIT_SEQ_LENGTH.out.fastx.map { meta, fasta -> [meta + [category: 'long'], fasta] })
             .filter { meta, fasta ->
@@ -114,7 +138,7 @@ workflow FUNCSCAN {
         ch_versions = ch_versions.mix(SEQKIT_SEQ_LENGTH.out.versions)
     }
     else {
-        ch_input_for_annotation = ch_intermediate_input.fastas.map { meta, fasta, protein, gbk -> [meta, fasta] }
+        ch_input_for_annotation = ch_intermediate_input_renamed.fastas.map { meta, fasta, protein, gbk -> [meta, fasta] }
     }
 
     /*
@@ -131,13 +155,13 @@ workflow FUNCSCAN {
             .join(ANNOTATION.out.gbk)
     }
     else {
-        ch_new_annotation = ch_intermediate_input.fastas
+        ch_new_annotation = ch_intermediate_input_renamed.fastas
     }
 
     // Mix back the preannotated samples with the newly annotated ones
     ch_prepped_input = ch_new_annotation
         .filter { meta, fasta, faa, gbk -> meta.category != 'long' }
-        .mix(ch_intermediate_input.preannotated)
+        .mix(ch_intermediate_input_renamed.preannotated)
         .multiMap { meta, fasta, faa, gbk ->
             fastas: [meta, fasta]
             faas: [meta, faa]
@@ -148,7 +172,7 @@ workflow FUNCSCAN {
 
         ch_prepped_input_long = ch_new_annotation
             .filter { meta, fasta, faa, gbk -> meta.category == 'long' }
-            .mix(ch_intermediate_input.preannotated)
+            .mix(ch_intermediate_input_renamed.preannotated)
             .multiMap { meta, fasta, faa, gbk ->
                 fastas: [meta, fasta]
                 faas: [meta, faa]
